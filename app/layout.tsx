@@ -1,0 +1,32 @@
+import type { Metadata } from "next";
+import { Manrope, Space_Grotesk } from "next/font/google";
+import "./globals.css";
+
+const manrope = Manrope({
+  subsets: ["latin"],
+  variable: "--font-body",
+});
+
+const spaceGrotesk = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-display",
+});
+
+export const metadata: Metadata = {
+  title: "Rubik's Cube Solver",
+  description: "Interactive Rubik's Cube solver MVP with an animated cube, move controls, and step-by-step solving.",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <body className={`${manrope.variable} ${spaceGrotesk.variable}`}>
+        {children}
+      </body>
+    </html>
+  );
+}
