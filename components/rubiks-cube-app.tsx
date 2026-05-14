@@ -776,12 +776,13 @@ export function RubiksCubeApp() {
               </p>
               <div className="space-y-4">
                 <h1 className="max-w-3xl font-[family-name:var(--font-display)] text-4xl leading-tight sm:text-5xl">
-                  Rubik&apos;s Cube solver with a tactile UI, move controls, and guided playback.
+                  Interactive Rubik&apos;s Cube Solver
                 </h1>
                 <p className="max-w-2xl text-base text-slate-300 sm:text-lg">
-                  Frontend-first and portfolio-ready: scramble the cube, apply face turns, inspect
-                  move history, and generate a solver-powered sequence you can step through one move
-                  at a time.
+                  This project is an interactive Rubik&apos;s Cube web app where users can rotate
+                  the cube, apply moves, scramble the state, and step through a generated
+                  solution. It is designed as a clean frontend-focused demo that combines 3D
+                  interaction, move controls, and guided playback.
                 </p>
               </div>
               <div className="flex flex-wrap gap-3 text-sm text-slate-200">
@@ -797,15 +798,15 @@ export function RubiksCubeApp() {
             <div className="grid gap-4 sm:grid-cols-3 lg:grid-cols-1">
               <FeatureCard
                 title="Interactive cube"
-                description="A draggable 3D cube stage keeps the core interaction visual and immediate."
+                description="Rotate the cube freely and inspect it from different angles in a responsive 3D view."
               />
               <FeatureCard
-                title="Guided solve viewer"
-                description="Preview each solver move with previous and next step controls."
+                title="Move playback"
+                description="Apply moves manually, generate a solution, and step through each move one at a time."
               />
               <FeatureCard
-                title="Frontend-only"
-                description="No auth, no database, no backend dependencies in this phase."
+                title="Frontend project"
+                description="Built as a polished frontend demo focused on interaction design, cube controls, and usability."
               />
             </div>
           </div>
