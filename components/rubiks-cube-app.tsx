@@ -32,21 +32,81 @@ type RotationState = {
   y: number;
 };
 
+type Vector3 = {
+  x: number;
+  y: number;
+  z: number;
+};
+
+type StageDragState =
+  | {
+      mode: "cube";
+      x: number;
+      y: number;
+      rotateX: number;
+      rotateY: number;
+    }
+  | {
+      mode: "face";
+      x: number;
+      y: number;
+      face: keyof typeof FACE_GESTURE_VECTORS;
+      startedOnSticker: boolean;
+      rowBand: -1 | 0 | 1;
+      columnBand: -1 | 0 | 1;
+      facePoint: { x: number; y: number };
+      resolved: boolean;
+    };
+
+const FACE_GESTURE_THRESHOLD = 18;
+const FACE_GESTURE_VECTORS = {
+  F: {
+    normal: { x: 0, y: 0, z: 1 },
+    right: { x: 1, y: 0, z: 0 },
+    down: { x: 0, y: -1, z: 0 },
+  },
+  B: {
+    normal: { x: 0, y: 0, z: -1 },
+    right: { x: -1, y: 0, z: 0 },
+    down: { x: 0, y: -1, z: 0 },
+  },
+  R: {
+    normal: { x: 1, y: 0, z: 0 },
+    right: { x: 0, y: 0, z: -1 },
+    down: { x: 0, y: -1, z: 0 },
+  },
+  L: {
+    normal: { x: -1, y: 0, z: 0 },
+    right: { x: 0, y: 0, z: 1 },
+    down: { x: 0, y: -1, z: 0 },
+  },
+  U: {
+    normal: { x: 0, y: 1, z: 0 },
+    right: { x: 1, y: 0, z: 0 },
+    down: { x: 0, y: 0, z: 1 },
+  },
+  D: {
+    normal: { x: 0, y: -1, z: 0 },
+    right: { x: 1, y: 0, z: 0 },
+    down: { x: 0, y: 0, z: -1 },
+  },
+} as const;
+
 function CubeStage({
   facelets,
   rotation,
   onRotationChange,
+  onMove,
   disabled,
 }: {
   facelets: string;
   rotation: RotationState;
   onRotationChange: (rotation: RotationState) => void;
+  onMove: (move: string) => void;
   disabled?: boolean;
 }) {
   const faces = useMemo(() => parseFacelets(facelets), [facelets]);
-  const dragState = useRef<{ x: number; y: number; rotateX: number; rotateY: number } | null>(
-    null,
-  );
+  const dragState = useRef<StageDragState | null>(null);
   const cubeRef = useRef<HTMLDivElement | null>(null);
   const frameRef = useRef<number | null>(null);
   const liveRotationRef = useRef(rotation);
@@ -92,12 +152,50 @@ function CubeStage({
       return;
     }
 
-    dragState.current = {
-      x: event.clientX,
-      y: event.clientY,
-      rotateX: liveRotationRef.current.x,
-      rotateY: liveRotationRef.current.y,
-    };
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const faceTarget = target?.closest<HTMLElement>("[data-face-surface]");
+    const stickerTarget = target?.closest<HTMLElement>("[data-sticker-index]");
+    const face = faceTarget?.dataset.faceSurface as keyof typeof FACE_GESTURE_VECTORS | undefined;
+    const stickerIndex = Number(stickerTarget?.dataset.stickerIndex ?? "4");
+    const normalizedStickerIndex = Number.isNaN(stickerIndex) ? 4 : stickerIndex;
+    const facePoint =
+      face && faceTarget
+        ? getFaceLocalPoint(
+            faceTarget,
+            face,
+            liveRotationRef.current,
+            event.clientX,
+            event.clientY,
+          )
+        : { x: 0, y: 0 };
+
+    dragState.current = face
+      ? {
+          mode: "face",
+          x: event.clientX,
+          y: event.clientY,
+          face,
+          startedOnSticker: Boolean(stickerTarget),
+          rowBand: resolveLockedBand(
+            facePoint.y,
+            Math.max(0, Math.min(2, Math.floor(normalizedStickerIndex / 3))) - 1,
+            Boolean(stickerTarget),
+          ),
+          columnBand: resolveLockedBand(
+            facePoint.x,
+            Math.max(0, Math.min(2, normalizedStickerIndex % 3)) - 1,
+            Boolean(stickerTarget),
+          ),
+          facePoint,
+          resolved: false,
+        }
+      : {
+          mode: "cube",
+          x: event.clientX,
+          y: event.clientY,
+          rotateX: liveRotationRef.current.x,
+          rotateY: liveRotationRef.current.y,
+        };
 
     event.currentTarget.setPointerCapture(event.pointerId);
   };
@@ -110,10 +208,48 @@ function CubeStage({
     const deltaX = event.clientX - dragState.current.x;
     const deltaY = event.clientY - dragState.current.y;
 
-    applyRotation({
-      x: Math.max(-75, Math.min(75, dragState.current.rotateX - deltaY * 0.35)),
-      y: dragState.current.rotateY + deltaX * 0.4,
+    if (dragState.current.mode === "cube") {
+      applyRotation({
+        x: Math.max(-75, Math.min(75, dragState.current.rotateX - deltaY * 0.35)),
+        y: dragState.current.rotateY + deltaX * 0.4,
+      });
+      return;
+    }
+
+    if (
+      dragState.current.resolved ||
+      Math.hypot(deltaX, deltaY) < FACE_GESTURE_THRESHOLD
+    ) {
+      return;
+    }
+
+    const move = resolveFaceGestureMove(
+      dragState.current.face,
+      dragState.current.startedOnSticker,
+      dragState.current.rowBand,
+      dragState.current.columnBand,
+      dragState.current.facePoint,
+      liveRotationRef.current,
+      deltaX,
+      deltaY,
+    );
+
+    if (!move) {
+      return;
+    }
+
+    logGestureDecision({
+      pickedFace: dragState.current.face,
+      facePoint: dragState.current.facePoint,
+      rowBand: dragState.current.rowBand,
+      columnBand: dragState.current.columnBand,
+      deltaX,
+      deltaY,
+      move,
     });
+
+    dragState.current.resolved = true;
+    onMove(move);
   };
 
   const handlePointerEnd = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -121,13 +257,16 @@ function CubeStage({
       return;
     }
 
+    if (dragState.current.mode === "cube") {
+      onRotationChange(liveRotationRef.current);
+    }
+
     dragState.current = null;
     event.currentTarget.releasePointerCapture(event.pointerId);
-    onRotationChange(liveRotationRef.current);
   };
 
   return (
-    <div className="glass-panel relative overflow-hidden rounded-[2rem] p-6 sm:p-8">
+    <div className="glass-panel relative overflow-hidden rounded-[1.5rem] p-6 sm:p-8">
       <div className="mesh-background pointer-events-none absolute inset-0 opacity-50" />
       <div className="relative flex flex-col gap-5">
         <div className="flex items-center justify-between gap-4">
@@ -135,12 +274,12 @@ function CubeStage({
             <p className="text-xs uppercase tracking-[0.35em] text-emerald-200/60">Cube View</p>
             <h2 className="font-[family-name:var(--font-display)] text-2xl">Interactive Stage</h2>
           </div>
-          <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-300">
+          <span className="rounded-xl border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-300">
             Drag to rotate
           </span>
         </div>
 
-        <div className="relative flex min-h-[420px] items-center justify-center overflow-hidden rounded-[1.6rem] border border-white/10 bg-slate-950/35">
+        <div className="relative flex min-h-[420px] items-center justify-center overflow-hidden rounded-[1.25rem] border border-white/10 bg-slate-950/35">
           <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(196,240,158,0.16),transparent_42%),radial-gradient(circle_at_bottom,rgba(59,130,246,0.16),transparent_34%)]" />
           <div className="absolute h-40 w-40 rounded-full bg-emerald-300/15 blur-3xl" />
           <div
@@ -164,12 +303,14 @@ function CubeStage({
                     className="absolute left-1/2 top-1/2 h-[180px] w-[180px] -translate-x-1/2 -translate-y-1/2 [transform-style:preserve-3d]"
                   >
                     <div
-                      className="grid h-full w-full grid-cols-3 gap-[6px] rounded-[1.25rem] border border-white/12 bg-slate-950/70 p-[10px] shadow-[0_20px_80px_rgba(0,0,0,0.4)]"
+                      data-face-surface={face}
+                      className="grid h-full w-full grid-cols-3 gap-[6px] rounded-[1rem] border border-white/12 bg-slate-950/70 p-[10px] shadow-[0_20px_80px_rgba(0,0,0,0.4)] [backface-visibility:hidden]"
                       style={{ transform: faceTransform(face) }}
                     >
                       {stickers.map((sticker, index) => (
                         <div
                           key={`${face}-${index}`}
+                          data-sticker-index={index}
                           className="rounded-[0.6rem] border border-black/15 shadow-[inset_0_1px_1px_rgba(255,255,255,0.5),0_4px_18px_rgba(0,0,0,0.18)]"
                           style={{ backgroundColor: STICKER_COLORS[sticker] }}
                         />
@@ -205,6 +346,272 @@ function faceTransform(face: string) {
   }
 }
 
+function resolveFaceGestureMove(
+  face: keyof typeof FACE_GESTURE_VECTORS,
+  startedOnSticker: boolean,
+  rowBand: -1 | 0 | 1,
+  columnBand: -1 | 0 | 1,
+  facePoint: { x: number; y: number },
+  rotation: RotationState,
+  deltaX: number,
+  deltaY: number,
+) {
+  const gesture = FACE_GESTURE_VECTORS[face];
+  const rightVector = normalizeScreenVector(projectVectorToScreen(rotateVector(gesture.right, rotation)));
+  const downVector = normalizeScreenVector(projectVectorToScreen(rotateVector(gesture.down, rotation)));
+  const localDrag = {
+    x: dotProduct2D({ x: deltaX, y: deltaY }, rightVector),
+    y: dotProduct2D({ x: deltaX, y: deltaY }, downVector),
+  };
+  const isHorizontal = Math.abs(localDrag.x) >= Math.abs(localDrag.y);
+  const dominantDrag = isHorizontal
+    ? { x: Math.sign(localDrag.x) || 1, y: 0 }
+    : { x: 0, y: Math.sign(localDrag.y) || 1 };
+  const moveSelection = resolveMoveSelection(
+    face,
+    startedOnSticker,
+    rowBand,
+    columnBand,
+    isHorizontal,
+  );
+
+  if (!moveSelection) {
+    return null;
+  }
+  const moveNormal =
+    moveSelection.offset === 0
+      ? getSliceReferenceNormal(moveSelection.axisVector)
+      : scaleVector(moveSelection.axisVector, moveSelection.offset);
+  const interactionPoint = addVectors(
+    addVectors(
+      gesture.normal,
+      scaleVector(gesture.right, clampEdgeCoordinate(facePoint.x)),
+    ),
+    addVectors(
+      scaleVector(gesture.down, clampEdgeCoordinate(facePoint.y)),
+      scaleVector(moveSelection.axisVector, moveSelection.offset),
+    ),
+  );
+  const worldDrag = addVectors(
+    scaleVector(gesture.right, dominantDrag.x),
+    scaleVector(gesture.down, dominantDrag.y),
+  );
+  const positiveTangent = crossProduct(moveNormal, interactionPoint);
+  const rotationSign = dotProduct(positiveTangent, worldDrag) >= 0 ? 1 : -1;
+
+  return `${formatLayerMove(moveSelection, rotationSign)}${rotationSign === -1 ? "" : "'"}`;
+}
+
+function getFaceLocalPoint(
+  faceElement: HTMLElement | null | undefined,
+  face: keyof typeof FACE_GESTURE_VECTORS,
+  rotation: RotationState,
+  clientX: number,
+  clientY: number,
+) {
+  if (!faceElement) {
+    return { x: 0, y: 0 };
+  }
+
+  const gesture = FACE_GESTURE_VECTORS[face];
+  const rightVector = normalizeScreenVector(projectVectorToScreen(rotateVector(gesture.right, rotation)));
+  const downVector = normalizeScreenVector(projectVectorToScreen(rotateVector(gesture.down, rotation)));
+  const rect = faceElement.getBoundingClientRect();
+  const screenOffset = {
+    x: clientX - (rect.left + rect.width / 2),
+    y: clientY - (rect.top + rect.height / 2),
+  };
+  const scale = Math.max(1, Math.min(rect.width, rect.height) / 2);
+  const localPoint = clampLocalPoint({
+    x: dotProduct2D(screenOffset, rightVector) / scale,
+    y: dotProduct2D(screenOffset, downVector) / scale,
+  });
+
+  return localPoint;
+}
+
+function clampLocalPoint(point: { x: number; y: number }) {
+  return {
+    x: Math.max(-1, Math.min(1, point.x)),
+    y: Math.max(-1, Math.min(1, point.y)),
+  };
+}
+
+function resolveMoveSelection(
+  pickedFace: keyof typeof FACE_GESTURE_VECTORS,
+  startedOnSticker: boolean,
+  rowBand: -1 | 0 | 1,
+  columnBand: -1 | 0 | 1,
+  isHorizontal: boolean,
+): { axisVector: Vector3; offset: -1 | 0 | 1 } | null {
+  const gesture = FACE_GESTURE_VECTORS[pickedFace];
+  const axisVector = isHorizontal ? gesture.down : gesture.right;
+  const offset = isHorizontal ? rowBand : columnBand;
+
+  if (axisVector.z !== 0 && !startedOnSticker) {
+    return null;
+  }
+
+  return { axisVector, offset };
+}
+
+function clampEdgeCoordinate(value: number) {
+  return Math.max(-0.85, Math.min(0.85, value));
+}
+
+function resolveLockedBand(
+  coordinate: number,
+  stickerBand: number,
+  preferStickerBand: boolean,
+): -1 | 0 | 1 {
+  if (preferStickerBand) {
+    if (stickerBand < 0) {
+      return -1;
+    }
+
+    if (stickerBand > 0) {
+      return 1;
+    }
+
+    return 0;
+  }
+
+  const CENTER_BAND_THRESHOLD = 0.28;
+
+  if (coordinate <= -CENTER_BAND_THRESHOLD) {
+    return -1;
+  }
+
+  if (coordinate >= CENTER_BAND_THRESHOLD) {
+    return 1;
+  }
+
+  if (stickerBand < 0) {
+    return -1;
+  }
+
+  if (stickerBand > 0) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function getSliceReferenceNormal(axisVector: Vector3): Vector3 {
+  if (axisVector.x !== 0) {
+    return { x: -1, y: 0, z: 0 };
+  }
+
+  if (axisVector.y !== 0) {
+    return { x: 0, y: -1, z: 0 };
+  }
+
+  return { x: 0, y: 0, z: 1 };
+}
+
+function formatLayerMove(
+  selection: { axisVector: Vector3; offset: -1 | 0 | 1 },
+  rotationSign: number,
+) {
+  if (selection.offset === 0) {
+    if (selection.axisVector.x !== 0) {
+      return "M";
+    }
+
+    if (selection.axisVector.y !== 0) {
+      return "E";
+    }
+
+    return "S";
+  }
+
+  return vectorToFace(scaleVector(selection.axisVector, selection.offset));
+}
+
+function logGestureDecision(data: {
+  pickedFace: keyof typeof FACE_GESTURE_VECTORS;
+  facePoint: { x: number; y: number };
+  rowBand: -1 | 0 | 1;
+  columnBand: -1 | 0 | 1;
+  deltaX: number;
+  deltaY: number;
+  move: string;
+}) {
+  if (process.env.NODE_ENV === "production") {
+    return;
+  }
+
+  console.debug("[cube-gesture]", data);
+}
+
+function vectorToFace(vector: Vector3): keyof typeof FACE_GESTURE_VECTORS {
+  if (vector.x === 1) {
+    return "R";
+  }
+
+  if (vector.x === -1) {
+    return "L";
+  }
+
+  if (vector.y === 1) {
+    return "U";
+  }
+
+  if (vector.y === -1) {
+    return "D";
+  }
+
+  return vector.z === 1 ? "F" : "B";
+}
+
+function addVectors(a: Vector3, b: Vector3): Vector3 {
+  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
+
+function scaleVector(vector: Vector3, scalar: number): Vector3 {
+  return { x: vector.x * scalar, y: vector.y * scalar, z: vector.z * scalar };
+}
+
+function negateVector(vector: Vector3): Vector3 {
+  return scaleVector(vector, -1);
+}
+
+function crossProduct(a: Vector3, b: Vector3): Vector3 {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x,
+  };
+}
+
+function dotProduct(a: Vector3, b: Vector3) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+function projectVectorToScreen(vector: Vector3) {
+  return {
+    x: vector.x,
+    y: -vector.y,
+  };
+}
+
+function normalizeScreenVector(vector: { x: number; y: number }) {
+  const length = Math.hypot(vector.x, vector.y);
+
+  if (length === 0) {
+    return { x: 0, y: 0 };
+  }
+
+  return {
+    x: vector.x / length,
+    y: vector.y / length,
+  };
+}
+
+function dotProduct2D(a: { x: number; y: number }, b: { x: number; y: number }) {
+  return a.x * b.x + a.y * b.y;
+}
+
 function SectionHeader({
   icon,
   eyebrow,
@@ -218,7 +625,7 @@ function SectionHeader({
 }) {
   return (
     <div className="flex items-start gap-4">
-      <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-emerald-200/10 bg-emerald-300/10 text-emerald-100">
+      <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-emerald-200/10 bg-emerald-300/10 text-emerald-100">
         {icon}
       </div>
       <div>
@@ -360,7 +767,7 @@ export function RubiksCubeApp() {
       </div>
 
       <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-6">
-        <section className="glass-panel overflow-hidden rounded-[2.25rem] px-6 py-8 sm:px-8">
+        <section className="glass-panel overflow-hidden rounded-[1.75rem] px-6 py-8 sm:px-8">
           <div className="mesh-background pointer-events-none absolute inset-0 opacity-60" />
           <div className="relative grid gap-8 lg:grid-cols-[1.2fr_0.8fr]">
             <div className="space-y-5">
@@ -409,6 +816,7 @@ export function RubiksCubeApp() {
             facelets={cubeFacelets}
             rotation={rotation}
             onRotationChange={setRotation}
+            onMove={(move) => runAlgorithm(move, "manual")}
             disabled={isApplyingMove || isSolving}
           />
 
@@ -428,7 +836,7 @@ export function RubiksCubeApp() {
                     type="button"
                     onClick={() => runAlgorithm(move.actualMove, "manual")}
                     disabled={isApplyingMove || isSolving}
-                    className="rounded-2xl border border-white/10 bg-white/6 px-3 py-3 text-sm font-semibold text-slate-100 transition hover:border-emerald-300/35 hover:bg-emerald-300/10 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="rounded-xl border border-white/10 bg-white/6 px-3 py-3 text-sm font-semibold text-slate-100 transition hover:border-emerald-300/35 hover:bg-emerald-300/10 disabled:cursor-not-allowed disabled:opacity-50"
                     title={`Applies ${move.actualMove} on the cube`}
                   >
                     <span>{move.label}</span>
@@ -436,7 +844,7 @@ export function RubiksCubeApp() {
                 ))}
               </div>
 
-              <div className="mt-4 rounded-2xl border border-white/10 bg-black/15 p-4 text-sm text-slate-300">
+              <div className="mt-4 rounded-xl border border-white/10 bg-black/15 p-4 text-sm text-slate-300">
                 <p>
                   Controls are view-relative. Current mapping:{" "}
                   {VIEW_FACES.map((face) => `${face}→${relativeFaceMap[face]}`).join("  ")}
@@ -465,7 +873,7 @@ export function RubiksCubeApp() {
                 />
               </div>
 
-              <div className="mt-4 rounded-2xl border border-white/10 bg-black/15 p-4 text-sm">
+              <div className="mt-4 rounded-xl border border-white/10 bg-black/15 p-4 text-sm">
                 <p className="text-slate-200">
                   <span className="text-slate-400">Current scramble:</span>{" "}
                   {scramble.length > 0 ? scramble.join(" ") : "No scramble generated yet."}
@@ -473,7 +881,7 @@ export function RubiksCubeApp() {
               </div>
 
               {error ? (
-                <p className="mt-4 rounded-2xl border border-rose-300/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
+                <p className="mt-4 rounded-xl border border-rose-300/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
                   {error}
                 </p>
               ) : null}
@@ -492,7 +900,7 @@ export function RubiksCubeApp() {
                   history.map((entry, index) => (
                     <div
                       key={`${entry.move}-${index}`}
-                      className="flex items-center justify-between rounded-2xl border border-white/8 bg-white/5 px-4 py-3 text-sm"
+                      className="flex items-center justify-between rounded-xl border border-white/8 bg-white/5 px-4 py-3 text-sm"
                     >
                       <div className="flex items-center gap-3">
                         <span className="w-8 text-xs text-slate-500">
@@ -500,7 +908,7 @@ export function RubiksCubeApp() {
                         </span>
                         <span className="font-semibold text-white">{entry.move}</span>
                       </div>
-                      <span className="rounded-full border border-white/8 bg-black/20 px-2 py-1 text-[11px] uppercase tracking-[0.25em] text-slate-400">
+                      <span className="rounded-lg border border-white/8 bg-black/20 px-2 py-1 text-[11px] uppercase tracking-[0.25em] text-slate-400">
                         {entry.source}
                       </span>
                     </div>
@@ -540,7 +948,7 @@ export function RubiksCubeApp() {
 
             {solution ? (
               <div className="mt-6 space-y-5">
-                <div className="rounded-[1.6rem] border border-white/10 bg-black/15 p-5">
+                <div className="rounded-[1.25rem] border border-white/10 bg-black/15 p-5">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <p className="text-sm text-slate-400">Step progress</p>
@@ -548,9 +956,9 @@ export function RubiksCubeApp() {
                         {solution.currentStep}/{solution.moves.length}
                       </p>
                     </div>
-                    <div className="min-w-[220px] flex-1 rounded-full bg-white/8 p-1">
+                    <div className="min-w-[220px] flex-1 rounded-xl bg-white/8 p-1">
                       <div
-                        className="h-2 rounded-full bg-gradient-to-r from-emerald-300 to-lime-200 transition-all"
+                        className="h-2 rounded-lg bg-gradient-to-r from-emerald-300 to-lime-200 transition-all"
                         style={{
                           width: `${solution.moves.length === 0 ? 100 : (solution.currentStep / solution.moves.length) * 100}%`,
                         }}
@@ -592,7 +1000,7 @@ export function RubiksCubeApp() {
                           key={`${move}-${index}`}
                           type="button"
                           onClick={() => void setSolutionStep(index + 1)}
-                          className={`rounded-2xl border px-4 py-4 text-left transition ${
+                          className={`rounded-xl border px-4 py-4 text-left transition ${
                             isCurrent
                               ? "border-emerald-300/45 bg-emerald-300/12"
                               : isDone
@@ -687,7 +1095,7 @@ function pickFace(
 }
 
 function Panel({ children }: { children: React.ReactNode }) {
-  return <section className="glass-panel rounded-[2rem] p-6 sm:p-7">{children}</section>;
+  return <section className="glass-panel rounded-[1.5rem] p-6 sm:p-7">{children}</section>;
 }
 
 function ActionButton({
@@ -708,7 +1116,7 @@ function ActionButton({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className={`inline-flex items-center gap-2 rounded-full px-4 py-2.5 text-sm font-semibold transition ${
+      className={`inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition ${
         subtle
           ? "border border-white/10 bg-white/5 text-slate-100 hover:border-white/20 hover:bg-white/10"
           : "bg-gradient-to-r from-emerald-300 to-lime-200 text-slate-950 hover:brightness-105"
@@ -722,7 +1130,7 @@ function ActionButton({
 
 function MetricBadge({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-full border border-white/10 bg-white/6 px-4 py-2">
+    <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-2">
       <span className="text-slate-400">{label}</span>
       <span className="ml-2 font-semibold text-white">{value}</span>
     </div>
@@ -737,7 +1145,7 @@ function FeatureCard({
   description: string;
 }) {
   return (
-    <div className="rounded-[1.6rem] border border-white/10 bg-white/5 p-4">
+    <div className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4">
       <p className="font-[family-name:var(--font-display)] text-lg text-white">{title}</p>
       <p className="mt-2 text-sm text-slate-300">{description}</p>
     </div>
@@ -746,7 +1154,7 @@ function FeatureCard({
 
 function StatusCard({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-[1.5rem] border border-white/10 bg-white/5 p-4">
+    <div className="rounded-[1.2rem] border border-white/10 bg-white/5 p-4">
       <p className="text-sm text-slate-400">{label}</p>
       <p className="mt-2 font-[family-name:var(--font-display)] text-xl text-white">{value}</p>
     </div>
@@ -755,7 +1163,7 @@ function StatusCard({ label, value }: { label: string; value: string }) {
 
 function EmptyState({ message }: { message: string }) {
   return (
-    <div className="rounded-[1.6rem] border border-dashed border-white/12 bg-white/3 px-4 py-8 text-center text-sm text-slate-400">
+    <div className="rounded-[1.25rem] border border-dashed border-white/12 bg-white/3 px-4 py-8 text-center text-sm text-slate-400">
       {message}
     </div>
   );
