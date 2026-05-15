@@ -23,6 +23,11 @@ import {
   parseFacelets,
   solveFacelets,
 } from "@/lib/cube";
+import {
+  SolveAttemptDetail,
+  SolveAttemptListItem,
+  SolveAttemptRecord,
+} from "@/lib/solve-attempts";
 
 const MOVE_BUTTONS = BASE_MOVES.flatMap((move) => [move, `${move}'`, `${move}2`]);
 const VIEW_FACES = ["U", "R", "F", "D", "L", "B"] as const;
@@ -612,6 +617,25 @@ function dotProduct2D(a: { x: number; y: number }, b: { x: number; y: number }) 
   return a.x * b.x + a.y * b.y;
 }
 
+function formatTimestamp(value: string) {
+  return new Intl.DateTimeFormat("en-US", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+function formatDuration(durationMs: number) {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (minutes === 0) {
+    return `${seconds}s`;
+  }
+
+  return `${minutes}m ${seconds}s`;
+}
+
 function SectionHeader({
   icon,
   eyebrow,
@@ -644,12 +668,29 @@ export function RubiksCubeApp() {
   const [error, setError] = useState<string | null>(null);
   const [solution, setSolution] = useState<SolutionState | null>(null);
   const [rotation, setRotation] = useState<RotationState>({ x: -24, y: -38 });
+  const [solveHistory, setSolveHistory] = useState<SolveAttemptListItem[]>([]);
+  const [selectedAttempt, setSelectedAttempt] = useState<SolveAttemptDetail | null>(null);
+  const [latestAttempt, setLatestAttempt] = useState<SolveAttemptRecord | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(true);
+  const [isAttemptLoading, setIsAttemptLoading] = useState(false);
+  const [isSavingAttempt, setIsSavingAttempt] = useState(false);
   const [isApplyingMove, startMoveTransition] = useTransition();
   const [isSolving, startSolvingTransition] = useTransition();
+  const attemptRef = useRef<{
+    startedAt: number | null;
+    startFacelets: string | null;
+    lastSavedSignature: string | null;
+  }>({
+    startedAt: null,
+    startFacelets: null,
+    lastSavedSignature: null,
+  });
 
   const isSolved = cubeFacelets === SOLVED_FACELETS;
   const moveCount = history.length;
   const nextSolutionMove = solution?.moves[solution.currentStep] ?? null;
+  const latestFeedback = latestAttempt?.ai_feedback ?? solveHistory[0]?.ai_feedback ?? null;
   const relativeFaceMap = useMemo(() => getRelativeFaceMap(rotation), [rotation]);
   const moveButtons = useMemo(
     () =>
@@ -676,8 +717,138 @@ export function RubiksCubeApp() {
     [relativeFaceMap],
   );
 
+  const loadSolveHistory = async () => {
+    try {
+      setIsHistoryLoading(true);
+      const response = await fetch("/api/solve-attempts", { cache: "no-store" });
+      const payload = (await response.json()) as { attempts?: SolveAttemptListItem[]; error?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Failed to load solve history.");
+      }
+
+      setSolveHistory(payload.attempts ?? []);
+      setHistoryError(null);
+    } catch (loadError) {
+      setHistoryError(loadError instanceof Error ? loadError.message : "Failed to load solve history.");
+    } finally {
+      setIsHistoryLoading(false);
+    }
+  };
+
+  const loadAttemptDetail = async (id: string) => {
+    try {
+      setIsAttemptLoading(true);
+      const response = await fetch(`/api/solve-attempts/${id}/analysis`, { cache: "no-store" });
+      const payload = (await response.json()) as { attempt?: SolveAttemptDetail; error?: string };
+
+      if (!response.ok || !payload.attempt) {
+        throw new Error(payload.error ?? "Failed to load solve attempt.");
+      }
+
+      setSelectedAttempt(payload.attempt);
+      setHistoryError(null);
+    } catch (loadError) {
+      setHistoryError(loadError instanceof Error ? loadError.message : "Failed to load solve attempt.");
+    } finally {
+      setIsAttemptLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const run = async () => {
+      await loadSolveHistory();
+    };
+
+    void run();
+  }, []);
+
+  useEffect(() => {
+    if (!isSolved || history.length === 0 || isSavingAttempt) {
+      return;
+    }
+
+    const signature = JSON.stringify({
+      scramble,
+      moves: history,
+      solved: isSolved,
+      endFacelets: cubeFacelets,
+    });
+
+    if (attemptRef.current.lastSavedSignature === signature) {
+      return;
+    }
+
+    const run = async () => {
+      try {
+        setIsSavingAttempt(true);
+        const response = await fetch("/api/solve-attempts", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            scramble,
+            moveHistory: history,
+            solved: isSolved,
+            solveDurationMs:
+              attemptRef.current.startedAt === null ? null : Date.now() - attemptRef.current.startedAt,
+            solverSolution: solution?.moves ?? null,
+            startFacelets: scramble.length > 0 ? null : attemptRef.current.startFacelets,
+            endFacelets: cubeFacelets,
+          }),
+        });
+        const payload = (await response.json()) as { attempt?: SolveAttemptRecord; error?: string };
+
+        if (!response.ok || !payload.attempt) {
+          throw new Error(payload.error ?? "Failed to save solve attempt.");
+        }
+
+        const attempt = payload.attempt;
+
+        attemptRef.current.lastSavedSignature = signature;
+        setLatestAttempt(attempt);
+        setSolveHistory((current) => [
+          {
+            id: attempt.id,
+            created_at: attempt.created_at,
+            solved: attempt.solved,
+            move_count: attempt.move_count,
+            solve_duration_ms: attempt.solve_duration_ms,
+            ai_feedback: attempt.ai_feedback,
+          },
+          ...current.filter((currentAttempt) => currentAttempt.id !== attempt.id),
+        ]);
+        setHistoryError(null);
+      } catch (saveError) {
+        setHistoryError(saveError instanceof Error ? saveError.message : "Failed to save solve attempt.");
+      } finally {
+        setIsSavingAttempt(false);
+      }
+    };
+
+    void run();
+  }, [cubeFacelets, history, isSolved, isSavingAttempt, scramble, solution]);
+
+  useEffect(() => {
+    if (selectedAttempt || solveHistory.length === 0 || isAttemptLoading) {
+      return;
+    }
+
+    const run = async () => {
+      await loadAttemptDetail(solveHistory[0].id);
+    };
+
+    void run();
+  }, [isAttemptLoading, selectedAttempt, solveHistory]);
+
   const runAlgorithm = (algorithm: string, source: MoveHistoryEntry["source"]) => {
     setError(null);
+
+    if (attemptRef.current.startedAt === null) {
+      attemptRef.current.startedAt = Date.now();
+      attemptRef.current.startFacelets = cubeFacelets;
+    }
 
     startMoveTransition(async () => {
       try {
@@ -696,6 +867,9 @@ export function RubiksCubeApp() {
   const handleScramble = () => {
     const nextScramble = buildScramble();
     setScramble(nextScramble);
+    attemptRef.current.startedAt = Date.now();
+    attemptRef.current.startFacelets = null;
+    attemptRef.current.lastSavedSignature = null;
     runAlgorithm(nextScramble.join(" "), "scramble");
   };
 
@@ -705,6 +879,10 @@ export function RubiksCubeApp() {
     setScramble([]);
     setSolution(null);
     setError(null);
+    setLatestAttempt(null);
+    attemptRef.current.startedAt = null;
+    attemptRef.current.startFacelets = null;
+    attemptRef.current.lastSavedSignature = null;
   };
 
   const handleSolve = () => {
@@ -771,18 +949,15 @@ export function RubiksCubeApp() {
           <div className="mesh-background pointer-events-none absolute inset-0 opacity-60" />
           <div className="relative grid gap-8 lg:grid-cols-[1.2fr_0.8fr]">
             <div className="space-y-5">
-              <p className="text-xs uppercase tracking-[0.4em] text-emerald-200/65">
-                Phase 1 MVP
-              </p>
               <div className="space-y-4">
                 <h1 className="max-w-3xl font-[family-name:var(--font-display)] text-4xl leading-tight sm:text-5xl">
                   Interactive Rubik&apos;s Cube Solver
                 </h1>
                 <p className="max-w-2xl text-base text-slate-300 sm:text-lg">
-                  This project is an interactive Rubik&apos;s Cube web app where users can rotate
-                  the cube, apply moves, scramble the state, and step through a generated
-                  solution. It is designed as a clean frontend-focused demo that combines 3D
-                  interaction, move controls, and guided playback.
+                  A full-stack Rubik&apos;s Cube experience with a responsive 3D cube, guided move
+                  playback, persisted solve history, and backend-generated performance feedback.
+                  It pairs tactile interaction on the frontend with solve analysis and coaching
+                  summaries that make each attempt easier to review.
                 </p>
               </div>
               <div className="flex flex-wrap gap-3 text-sm text-slate-200">
@@ -805,8 +980,8 @@ export function RubiksCubeApp() {
                 description="Apply moves manually, generate a solution, and step through each move one at a time."
               />
               <FeatureCard
-                title="Frontend project"
-                description="Built as a polished frontend demo focused on interaction design, cube controls, and usability."
+                title="History and feedback"
+                description="Review saved solves with backend analysis, redundant move metrics, and concise coaching notes."
               />
             </div>
           </div>
@@ -1026,6 +1201,150 @@ export function RubiksCubeApp() {
                 <EmptyState message="Generate a solution to open the walkthrough viewer." />
               </div>
             )}
+          </Panel>
+        </section>
+
+        <section className="grid gap-6 lg:grid-cols-[0.85fr_1.15fr]">
+          <Panel>
+            <SectionHeader
+              icon={<Sparkles className="h-5 w-5" />}
+              eyebrow="Feedback"
+              title="Latest Coaching"
+              description="Each saved solve is analyzed in the backend and summarized into short coaching notes."
+            />
+
+            <div className="mt-6 space-y-4">
+              <div className="rounded-[1.25rem] border border-white/10 bg-black/15 p-5">
+                <p className="text-sm text-slate-400">Most recent feedback</p>
+                <p className="mt-3 text-sm leading-7 text-slate-200">
+                  {latestFeedback ?? "Complete and save a solve to generate backend analysis and AI coaching feedback."}
+                </p>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <StatusCard
+                  label="Saved solves"
+                  value={String(solveHistory.length)}
+                />
+                <StatusCard
+                  label="Latest result"
+                  value={solveHistory[0] ? (solveHistory[0].solved ? "Solved" : "Unsolved") : "None"}
+                />
+              </div>
+            </div>
+          </Panel>
+
+          <Panel>
+            <SectionHeader
+              icon={<History className="h-5 w-5" />}
+              eyebrow="Persistence"
+              title="Solve History"
+              description="Saved attempts include solve metrics, redundant move analysis, and stored feedback."
+            />
+
+            {historyError ? (
+              <p className="mt-5 rounded-xl border border-rose-300/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
+                {historyError}
+              </p>
+            ) : null}
+
+            <div className="mt-6 grid gap-5 xl:grid-cols-[0.9fr_1.1fr]">
+              <div className="space-y-3">
+                {isHistoryLoading ? (
+                  <EmptyState message="Loading solve history..." />
+                ) : solveHistory.length > 0 ? (
+                  solveHistory.map((attempt) => (
+                    <button
+                      key={attempt.id}
+                      type="button"
+                      onClick={() => void loadAttemptDetail(attempt.id)}
+                      className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-4 text-left transition hover:border-emerald-300/35 hover:bg-white/8"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-sm font-semibold text-white">
+                          {formatTimestamp(attempt.created_at)}
+                        </span>
+                        <span className="rounded-lg border border-white/8 bg-black/20 px-2 py-1 text-[11px] uppercase tracking-[0.25em] text-slate-400">
+                          {attempt.solved ? "Solved" : "Unsolved"}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-sm text-slate-300">
+                        {attempt.move_count} moves
+                        {attempt.solve_duration_ms !== null
+                          ? ` • ${formatDuration(attempt.solve_duration_ms)}`
+                          : ""}
+                      </p>
+                      <p className="mt-3 text-sm leading-6 text-slate-400">
+                        {attempt.ai_feedback ?? "No AI feedback stored for this attempt yet."}
+                      </p>
+                    </button>
+                  ))
+                ) : (
+                  <EmptyState message="Saved solve attempts will appear here after you complete a solve." />
+                )}
+              </div>
+
+              <div className="rounded-[1.25rem] border border-white/10 bg-black/15 p-5">
+                {isAttemptLoading ? (
+                  <EmptyState message="Loading solve details..." />
+                ) : selectedAttempt ? (
+                  <div className="space-y-5">
+                    <div>
+                      <p className="text-sm text-slate-400">Selected attempt</p>
+                      <p className="mt-1 font-[family-name:var(--font-display)] text-2xl text-white">
+                        {formatTimestamp(selectedAttempt.created_at)}
+                      </p>
+                      <p className="mt-2 text-sm text-slate-300">
+                        {selectedAttempt.solved ? "Solved successfully." : "Attempt ended unsolved."}
+                      </p>
+                    </div>
+
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <StatusCard label="Move count" value={String(selectedAttempt.move_count)} />
+                      <StatusCard
+                        label="Optimal baseline"
+                        value={
+                          selectedAttempt.optimal_move_count === null
+                            ? "Unavailable"
+                            : String(selectedAttempt.optimal_move_count)
+                        }
+                      />
+                      <StatusCard
+                        label="Move delta"
+                        value={
+                          selectedAttempt.move_count_delta === null
+                            ? "Unavailable"
+                            : `${selectedAttempt.move_count_delta > 0 ? "+" : ""}${selectedAttempt.move_count_delta}`
+                        }
+                      />
+                      <StatusCard
+                        label="Inverse pairs"
+                        value={String(selectedAttempt.inverse_move_pairs)}
+                      />
+                    </div>
+
+                    <div className="space-y-3">
+                      <div>
+                        <p className="text-sm text-slate-400">Repeated patterns</p>
+                        <p className="mt-2 text-sm leading-6 text-slate-200">
+                          {selectedAttempt.repeated_move_patterns.length > 0
+                            ? selectedAttempt.repeated_move_patterns.join(", ")
+                            : "No repeated patterns were detected."}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-slate-400">Stored feedback</p>
+                        <p className="mt-2 text-sm leading-7 text-slate-200">
+                          {selectedAttempt.ai_feedback ?? "No feedback stored yet."}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <EmptyState message="Choose a saved solve to inspect its metrics and coaching feedback." />
+                )}
+              </div>
+            </div>
           </Panel>
         </section>
       </div>
